@@ -1,0 +1,13 @@
+backends:
+  - id: deepseek-chat
+    type: openai-compatible
+    base_url: "https://api.deepseek.com/v1"
+    api_key_env: "DEEPSEEK_API_KEY"
+    model: "deepseek-chat"
+  - id: gpt-4o-azure
+    type: azure
+    azure_endpoint: "https://your-azure-endpoint.openai.azure.com"
+    api_version: "2025-01-01-preview"
+    api_key_env: "AZURE_OPENAI_API_KEY"
+    model: "gpt-4o"
+default_backend: deepseek-chat

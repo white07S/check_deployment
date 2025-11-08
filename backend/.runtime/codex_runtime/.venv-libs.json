@@ -1,0 +1,19 @@
+{
+  "libs": [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "sqlalchemy",
+    "aiosqlite",
+    "httpx",
+    "numpy",
+    "pandas",
+    "polars",
+    "duckdb",
+    "requests",
+    "matplotlib",
+    "nltk",
+    "tqdm",
+    "scikit-learn"
+  ]
+}

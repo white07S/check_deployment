@@ -1,0 +1,11 @@
+.app-shell {
+  @apply flex min-h-screen bg-slate-950;
+}
+
+.sidebar {
+  @apply w-72 border-r border-slate-800 bg-slate-900/60 backdrop-blur;
+}
+
+.chat-main {
+  @apply flex-1 flex flex-col;
+}
