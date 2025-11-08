@@ -16,11 +16,13 @@ export function resolveWs(path) {
 
 async function handleJson(response) {
   const text = await response.text();
-  let payload;
-  try {
-    payload = text ? JSON.parse(text) : {};
-  } catch (error) {
-    throw new Error(`Unexpected response from server (${response.status})`);
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch (error) {
+      throw new Error(`Unexpected response from server (${response.status})`);
+    }
   }
 
   if (!response.ok) {
@@ -43,7 +45,34 @@ const buildQueryString = (params = {}) => {
   return queryString ? `?${queryString}` : "";
 };
 
-export const api = {
+export const chatApi = {
+  async listSessions(userId) {
+    const query = buildQueryString({ user_id: userId });
+    const response = await fetch(resolveHttp(`/sessions${query}`));
+    const payload = await handleJson(response);
+    return payload.sessions || [];
+  },
+
+  async createSession({ userId, llmSessionId, title }) {
+    const response = await fetch(resolveHttp(`/sessions`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: userId,
+        llm_session_id: llmSessionId,
+        title,
+      }),
+    });
+    return handleJson(response);
+  },
+
+  async listMessages({ userId, chatSessionId }) {
+    const query = buildQueryString({ user_id: userId });
+    const response = await fetch(resolveHttp(`/sessions/${chatSessionId}/messages${query}`));
+    const payload = await handleJson(response);
+    return payload.messages || [];
+  },
+
   async listPrompts(filters = {}, userId) {
     const query = buildQueryString({
       user_id: userId,
@@ -100,5 +129,3 @@ export const api = {
     return payload.suggestions || [];
   },
 };
-
-export default api;

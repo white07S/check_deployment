@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Check, Filter, Plus, Search, X } from "lucide-react";
 
-import { api } from "../api";
+import { chatApi } from "./api";
 import PromptCard from "./PromptCard";
 import PromptForm from "./PromptForm";
 
@@ -27,7 +27,7 @@ export default function PromptLibrary({ user, onSelectPrompt, onClose }) {
             .join(",")
         : undefined;
 
-      const data = await api.listPrompts(
+      const data = await chatApi.listPrompts(
         { user_created: filterUserCreated, keywords: keywordFilter },
         user
       );
@@ -60,7 +60,7 @@ export default function PromptLibrary({ user, onSelectPrompt, onClose }) {
 
   const handleCreatePrompt = async (formData) => {
     try {
-      await api.createPrompt(formData, user);
+      await chatApi.createPrompt(formData, user);
       setSuccess("Prompt created successfully.");
       setShowForm(false);
       setEditingPrompt(null);
@@ -73,7 +73,7 @@ export default function PromptLibrary({ user, onSelectPrompt, onClose }) {
 
   const handleUpdatePrompt = async (promptId, formData) => {
     try {
-      await api.updatePrompt(promptId, formData, user);
+      await chatApi.updatePrompt(promptId, formData, user);
       setSuccess("Prompt updated successfully.");
       setShowForm(false);
       setEditingPrompt(null);
@@ -89,7 +89,7 @@ export default function PromptLibrary({ user, onSelectPrompt, onClose }) {
       return;
     }
     try {
-      await api.deletePrompt(promptId, user);
+      await chatApi.deletePrompt(promptId, user);
       setSuccess("Prompt deleted successfully.");
       loadPrompts();
       setTimeout(dismissMessages, 3000);
@@ -100,7 +100,7 @@ export default function PromptLibrary({ user, onSelectPrompt, onClose }) {
 
   const handleCopyPrompt = async (promptId) => {
     try {
-      await api.copyPrompt(promptId, user);
+      await chatApi.copyPrompt(promptId, user);
       setSuccess("Prompt copied to your library.");
       loadPrompts();
       setTimeout(dismissMessages, 3000);
@@ -185,9 +185,7 @@ export default function PromptLibrary({ user, onSelectPrompt, onClose }) {
             <Filter className="h-4 w-4" />
             <button
               type="button"
-              onClick={() =>
-                setFilterUserCreated((prev) => (prev === true ? null : true))
-              }
+              onClick={() => setFilterUserCreated((prev) => (prev === true ? null : true))}
               className={`border-2 px-3 py-1 transition ${
                 filterUserCreated === true
                   ? "border-black bg-primary text-white"
@@ -198,9 +196,7 @@ export default function PromptLibrary({ user, onSelectPrompt, onClose }) {
             </button>
             <button
               type="button"
-              onClick={() =>
-                setFilterUserCreated((prev) => (prev === false ? null : false))
-              }
+              onClick={() => setFilterUserCreated((prev) => (prev === false ? null : false))}
               className={`border-2 px-3 py-1 transition ${
                 filterUserCreated === false
                   ? "border-black bg-primary text-white"
