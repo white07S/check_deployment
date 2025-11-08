@@ -19,14 +19,16 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.websockets import WebSocketState
 
 from .codex import CodexInvocationError, CodexRunner, SessionPaths
 from .config import ConfigError, load_gateway_config, resolve_paths
 from .db import build_engine, build_session_factory, init_models
 from .gateway import GatewayRegistry, build_gateway_router
 from .models import Base, ChatSession, LLMSession, Message, User
+from .prompts import build_prompts_router
 from .runtime import RuntimeInitializer, RuntimePreparationError
 from .schemas import (
     ChatSessionSummary,
@@ -62,9 +64,6 @@ def create_app() -> FastAPI:
     except ConfigError as exc:
         raise RuntimeError(f"Failed to load gateway configuration: {exc}") from exc
 
-    gateway_registry = GatewayRegistry(gateway_cfg)
-    app.include_router(build_gateway_router(gateway_registry))
-
     model_alias = os.environ.get("CODEX_MODEL_ALIAS", "internal-gateway")
     gateway_url = os.environ.get("CODEX_GATEWAY_URL", "http://127.0.0.1:8000")
     internal_api_key = os.environ.get("CODEX_INTERNAL_API_KEY", "internal-static-key")
@@ -75,6 +74,10 @@ def create_app() -> FastAPI:
             yield session
         finally:
             await session.close()
+
+    gateway_registry = GatewayRegistry(gateway_cfg)
+    app.include_router(build_gateway_router(gateway_registry))
+    app.include_router(build_prompts_router(get_session))
 
     @app.on_event("startup")
     async def on_startup() -> None:
@@ -143,6 +146,21 @@ def create_app() -> FastAPI:
                 except (AttributeError, NotImplementedError, OSError):
                     shutil.copytree(configs_src, workspace_configs, dirs_exist_ok=True)
 
+        config_path = codex_home / "config.toml"
+        config_text = "\n".join(
+            [
+                'model_reasoning_summary = "detailed"',
+                'model_reasoning_effort = "medium"',
+                "hide_agent_reasoning = false",
+                "show_raw_agent_reasoning = true",
+            ]
+        )
+        try:
+            config_path.write_text(config_text + "\n", encoding="utf-8")
+            os.chmod(config_path, 0o600)
+        except OSError:
+            pass
+
         chat_session = ChatSession(
             id=chat_session_id,
             user_id=payload.user_id,
@@ -173,7 +191,36 @@ def create_app() -> FastAPI:
             .where(ChatSession.user_id == user_id)
             .order_by(ChatSession.updated_at.desc())
         )
-        result = await db.scalars(stmt)
+        scalar_result = await db.scalars(stmt)
+        chat_records = list(scalar_result)
+        session_ids = [chat.id for chat in chat_records]
+
+        if session_ids:
+            counts_stmt = (
+                select(Message.chat_session_id, func.count(Message.id))
+                .where(Message.chat_session_id.in_(session_ids))
+                .group_by(Message.chat_session_id)
+            )
+            counts_result = await db.execute(counts_stmt)
+            counts_map = {chat_id: count for chat_id, count in counts_result}
+
+            row_number = func.row_number().over(partition_by=Message.chat_session_id, order_by=Message.created_at)
+            first_stmt = (
+                select(Message.chat_session_id, Message.content, row_number.label("rn"))
+                .where(
+                    Message.chat_session_id.in_(session_ids),
+                    Message.role == "user",
+                )
+            )
+            first_result = await db.execute(first_stmt)
+            first_map: dict[str, str] = {}
+            for chat_id, content, rn in first_result:
+                if rn == 1 and chat_id not in first_map:
+                    first_map[chat_id] = content
+        else:
+            counts_map = {}
+            first_map = {}
+
         sessions = [
             ChatSessionSummary(
                 id=chat.id,
@@ -181,9 +228,12 @@ def create_app() -> FastAPI:
                 backend_id=chat.backend_id,
                 created_at=chat.created_at,
                 updated_at=chat.updated_at,
+                first_message_preview=first_map.get(chat.id),
+                message_count=counts_map.get(chat.id, 0),
             )
-            for chat in result
+            for chat in chat_records
         ]
+
         return SessionsListResponse(sessions=sessions)
 
     @sessions_router.get("/{chat_session_id}/messages", response_model=MessagesListResponse)
@@ -239,6 +289,54 @@ def create_app() -> FastAPI:
             workspace_dir=Path(chat_session.workspace_dir),
         )
         codex_thread_id = chat_session.codex_thread_id
+        assistant_buffer = ""
+        reasoning_buffer = ""
+        assistant_final_sent = False
+
+        def _append_text_blocks(blocks: list[dict[str, object]] | None) -> str:
+            if not blocks:
+                return ""
+            parts: list[str] = []
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            return "".join(parts)
+
+        async def emit_reasoning_delta(delta: str) -> None:
+            nonlocal reasoning_buffer
+            if not delta:
+                return
+            reasoning_buffer += delta
+            await websocket.send_json({"type": "reasoning", "content": reasoning_buffer, "partial": True})
+
+        async def emit_reasoning_final(text: str) -> None:
+            nonlocal reasoning_buffer
+            final_text = text or reasoning_buffer
+            if not final_text:
+                return
+            reasoning_buffer = ""
+            await websocket.send_json({"type": "reasoning", "content": final_text})
+
+        async def emit_assistant_delta(delta: str) -> None:
+            nonlocal assistant_buffer
+            if not delta:
+                return
+            assistant_buffer += delta
+            await websocket.send_json({"type": "assistant_partial", "content": assistant_buffer})
+
+        async def emit_assistant_final(text: str) -> None:
+            nonlocal assistant_buffer, assistant_final_sent
+            final_text = text or assistant_buffer
+            if not final_text:
+                return
+            assistant_buffer = ""
+            await websocket.send_json({"type": "assistant", "content": final_text})
+            if not assistant_final_sent:
+                await store_message("assistant", final_text)
+                assistant_final_sent = True
 
         async def store_message(role: str, content: str) -> None:
             async with session_factory() as db:
@@ -282,6 +380,10 @@ def create_app() -> FastAPI:
                 await store_message("user", content)
 
                 try:
+                    assistant_buffer = ""
+                    reasoning_buffer = ""
+                    assistant_final_sent = False
+
                     async for event in runner.stream_turn(
                         prompt=content,
                         session_paths=session_paths,
@@ -289,26 +391,83 @@ def create_app() -> FastAPI:
                         codex_thread_id=codex_thread_id,
                     ):
                         event_type = event.get("type")
+                        payload = event.get("payload") or {}
+                        payload_type = payload.get("type")
+
                         if event_type == "thread.started":
                             thread_id = event.get("thread_id")
                             if thread_id and not codex_thread_id:
                                 codex_thread_id = thread_id
                                 await update_thread_id(thread_id)
+                        elif event_type == "event_msg":
+                            if payload_type in {"agent_reasoning_delta", "agent_reasoning_raw_content_delta"}:
+                                delta = payload.get("delta") or payload.get("message") or payload.get("text")
+                                if isinstance(delta, str):
+                                    await emit_reasoning_delta(delta)
+                            elif payload_type in {"agent_reasoning", "agent_reasoning_raw_content"}:
+                                text = payload.get("message") or payload.get("text")
+                                if isinstance(text, str):
+                                    await emit_reasoning_final(text)
+                            elif payload_type == "agent_reasoning_section_break":
+                                reasoning_buffer = ""
+                            elif payload_type == "agent_message_delta":
+                                delta = payload.get("delta")
+                                if isinstance(delta, str):
+                                    await emit_assistant_delta(delta)
+                            elif payload_type == "agent_message":
+                                text = payload.get("message")
+                                if isinstance(text, str):
+                                    await emit_assistant_final(text)
+                            elif payload_type == "token_count":
+                                continue
+                        elif event_type == "response_item":
+                            if payload_type in {"reasoning", "raw_reasoning"}:
+                                text = _append_text_blocks(payload.get("content"))
+                                if text:
+                                    await emit_reasoning_final(text)
+                            elif payload_type in {"reasoning_delta", "raw_reasoning_delta"}:
+                                text = _append_text_blocks(payload.get("content")) or payload.get("delta", "")
+                                if isinstance(text, str) and text:
+                                    await emit_reasoning_delta(text)
+                            elif payload_type in {"message_delta", "output_text_delta"}:
+                                delta_text = payload.get("delta")
+                                if isinstance(delta_text, str) and delta_text:
+                                    await emit_assistant_delta(delta_text)
+                                else:
+                                    combined = _append_text_blocks(payload.get("content"))
+                                    if combined:
+                                        await emit_assistant_delta(combined)
+                            elif payload_type == "message":
+                                role = payload.get("role")
+                                if role == "assistant":
+                                    response_text = _append_text_blocks(payload.get("content"))
+                                    if response_text and not assistant_final_sent:
+                                        await emit_assistant_final(response_text)
+                        elif event_type == "agent_reasoning_delta":
+                            delta = event.get("delta")
+                            if isinstance(delta, str):
+                                await emit_reasoning_delta(delta)
+                        elif event_type == "agent_message_delta":
+                            delta = event.get("delta")
+                            if isinstance(delta, str):
+                                await emit_assistant_delta(delta)
                         elif event_type == "item.completed":
                             item = event.get("item") or {}
                             item_type = item.get("type")
                             if item_type == "reasoning":
-                                await websocket.send_json({"type": "reasoning", "content": item.get("text", "")})
+                                text = item.get("text", "")
+                                if isinstance(text, str) and text:
+                                    await emit_reasoning_final(text)
                             elif item_type == "agent_message":
                                 text = item.get("text", "")
-                                await websocket.send_json({"type": "assistant", "content": text})
-                                await store_message("assistant", text)
+                                if isinstance(text, str) and text:
+                                    await emit_assistant_final(text)
                         elif event_type == "item.updated":
                             item = event.get("item") or {}
                             if item.get("type") == "reasoning":
-                                await websocket.send_json(
-                                    {"type": "reasoning", "content": item.get("text", ""), "partial": True}
-                                )
+                                text = item.get("text", "")
+                                if isinstance(text, str):
+                                    await emit_reasoning_delta(text)
                         elif event_type == "turn.failed":
                             error = event.get("error", {}).get("message", "Codex turn failed.")
                             await websocket.send_json({"type": "error", "content": error})
@@ -316,10 +475,19 @@ def create_app() -> FastAPI:
                         elif event_type == "error":
                             await websocket.send_json({"type": "error", "content": event.get("message", "")})
                             break
+                        elif event_type == "agent_reasoning":
+                            text = event.get("text")
+                            if isinstance(text, str):
+                                await emit_reasoning_final(text)
+                        elif event_type == "agent_message":
+                            text = event.get("text")
+                            if isinstance(text, str):
+                                await emit_assistant_final(text)
                 except CodexInvocationError as exc:
                     await websocket.send_json({"type": "error", "content": str(exc)})
 
         finally:
-            await websocket.close()
+            if websocket.client_state == WebSocketState.CONNECTED:
+                await websocket.close()
 
     return app

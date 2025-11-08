@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
+import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from sqlalchemy import ForeignKey, String, Text
+from sqlalchemy import Boolean, ForeignKey, String, Text
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql.sqltypes import DateTime
@@ -72,3 +74,56 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     chat_session: Mapped[ChatSession] = relationship(back_populates="messages")
+
+
+def _generate_prompt_id() -> str:
+    return str(uuid.uuid4())
+
+
+class Prompt(Base):
+    __tablename__ = "prompts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_generate_prompt_id)
+    user_id: Mapped[str] = mapped_column(String, nullable=False)
+    persona: Mapped[str] = mapped_column(String, nullable=False)
+    task: Mapped[str] = mapped_column(Text, nullable=False)
+    requires_data: Mapped[bool] = mapped_column(Boolean, default=False)
+    data: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    response: Mapped[str] = mapped_column(Text, nullable=False)
+    keywords_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    copied_from_prompt_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    copied_from_user_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    copied_from_user_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    def keywords(self) -> List[str]:
+        try:
+            value = json.loads(self.keywords_json or "[]")
+            if isinstance(value, list):
+                return [str(item) for item in value if isinstance(item, str)]
+        except json.JSONDecodeError:
+            pass
+        return []
+
+    def to_dict(self, *, requesting_user_id: Optional[str] = None) -> dict[str, Any]:
+        keywords = self.keywords()
+        is_owner = requesting_user_id is not None and self.user_id == requesting_user_id
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "persona": self.persona,
+            "task": self.task,
+            "if_task_need_data": bool(self.requires_data),
+            "data": self.data,
+            "response": self.response,
+            "keywords_used_for_search": keywords,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "copied_from_prompt_id": self.copied_from_prompt_id,
+            "copied_from_user_id": self.copied_from_user_id,
+            "copied_from_user_name": self.copied_from_user_name,
+            "is_copy": bool(self.copied_from_prompt_id),
+            "copied_from_user": self.copied_from_user_name,
+            "is_owner": is_owner,
+        }

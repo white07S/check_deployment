@@ -27,6 +27,8 @@ class ChatSessionSummary(BaseModel):
     backend_id: str
     created_at: datetime
     updated_at: datetime
+    first_message_preview: Optional[str] = None
+    message_count: int = 0
 
 
 class MessageRead(BaseModel):
@@ -101,3 +103,49 @@ class ResponsesRequest(BaseModel):
     max_output_tokens: Optional[int] = None
     temperature: Optional[float] = None
     metadata: Optional[dict[str, Any]] = None
+
+
+class PromptCreate(BaseModel):
+    persona: str
+    task: str
+    if_task_need_data: bool = False
+    data: Optional[str] = None
+    response: str
+    keywords_used_for_search: List[str] = Field(default_factory=list)
+
+
+class PromptUpdate(BaseModel):
+    persona: Optional[str] = None
+    task: Optional[str] = None
+    if_task_need_data: Optional[bool] = None
+    data: Optional[str] = None
+    response: Optional[str] = None
+    keywords_used_for_search: Optional[List[str]] = None
+
+
+class PromptFilter(BaseModel):
+    user_created: Optional[bool] = None
+    keywords: Optional[List[str]] = None
+
+
+class PromptCopy(BaseModel):
+    prompt_id: str
+
+
+class PromptRead(BaseModel):
+    id: str
+    user_id: str
+    persona: str
+    task: str
+    if_task_need_data: bool
+    data: Optional[str]
+    response: str
+    keywords_used_for_search: List[str]
+    created_at: datetime
+    updated_at: datetime
+    copied_from_prompt_id: Optional[str] = None
+    copied_from_user_id: Optional[str] = None
+    copied_from_user_name: Optional[str] = None
+    is_copy: bool = False
+    copied_from_user: Optional[str] = None
+    is_owner: bool = False
