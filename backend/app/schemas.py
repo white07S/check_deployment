@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 class SessionCreateRequest(BaseModel):
     user_id: str = Field(..., min_length=1)
     llm_session_id: str = Field(..., min_length=1)
+    mode: str = Field(..., description='Backend routing mode, e.g. "open-ai-comptiable" or "azure-ai"')
     title: Optional[str] = Field(default=None, max_length=120)
     model: Optional[str] = Field(default=None, description="Requested backend/model identifier")
 
@@ -53,6 +54,8 @@ class ChatCompletionMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    mode: str
+    llm_session_id: str
     model: Optional[str] = None
     messages: Sequence[ChatCompletionMessage]
     max_tokens: Optional[int] = None
@@ -98,6 +101,8 @@ class ResponseInputItem(BaseModel):
 
 
 class ResponsesRequest(BaseModel):
+    mode: str
+    llm_session_id: str
     model: Optional[str] = None
     input: List[ResponseInputItem] = Field(default_factory=list)
     max_output_tokens: Optional[int] = None

@@ -10,54 +10,58 @@ from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import AsyncAzureOpenAI, AsyncOpenAI
 
-from .config import ConfigError, GatewayBackendConfig, GatewayConfig
 from .schemas import ChatCompletionMessage, ChatCompletionRequest, ResponsesRequest
 
 
-class BackendClient:
-    def __init__(self, cfg: GatewayBackendConfig):
-        self.cfg = cfg
-        self.model_name = cfg.options.get("model")
-        if not self.model_name:
-            raise ConfigError(f"Backend '{cfg.id}' is missing required 'model' option.")
+def get_llm_client(mode: str, llm_session_id: str):
+    """
+    mode: "open-ai-comptiable" or "azure-ai"
+    llm_session_id: used to decide which backend to route to
+    """
+    # OpenAI-compatible (e.g. self-hosted / gateway)
+    if mode == "open-ai-comptiable" and llm_session_id.startswith("abc"):
+        return AsyncOpenAI(
+            base_url=os.getenv("OPENAI_COMPAT_BASE_URL"),
+            api_key=os.getenv("OPENAI_COMPAT_API_KEY"),
+        )
 
-        if cfg.backend_type == "openai-compatible":
-            base_url = cfg.options.get("base_url")
-            api_key_env = cfg.options.get("api_key_env")
-            if not base_url or not api_key_env:
-                raise ConfigError(
-                    f"Backend '{cfg.id}' requires 'base_url' and 'api_key_env' options."
-                )
-            api_key = os.getenv(api_key_env)
-            if not api_key:
-                raise ConfigError(
-                    f"Environment variable '{api_key_env}' required for backend '{cfg.id}'."
-                )
-            self.client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-        elif cfg.backend_type == "azure":
-            endpoint = cfg.options.get("azure_endpoint")
-            api_version = cfg.options.get("api_version")
-            api_key_env = cfg.options.get("api_key_env")
-            if not endpoint or not api_version or not api_key_env:
-                raise ConfigError(
-                    f"Azure backend '{cfg.id}' requires 'azure_endpoint', 'api_version', and 'api_key_env'."
-                )
-            api_key = os.getenv(api_key_env)
-            if not api_key:
-                raise ConfigError(
-                    f"Environment variable '{api_key_env}' required for backend '{cfg.id}'."
-                )
-            self.client = AsyncAzureOpenAI(
-                azure_endpoint=endpoint,
-                api_version=api_version,
-                api_key=api_key,
-            )
-        else:
-            raise ConfigError(f"Unknown backend type '{cfg.backend_type}' for backend '{cfg.id}'.")
+    # Azure OpenAI
+    if mode == "azure-ai" and llm_session_id.startswith("adc"):
+        return AsyncAzureOpenAI(
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-21"),
+        )
+
+    raise ValueError("No matching client for given mode and llm_session_id.")
+
+
+class BackendClient:
+    def __init__(self, mode: str, llm_session_id: str):
+        self.mode = mode
+        self.llm_session_id = llm_session_id
+        self.backend_id = mode
+        self.client = get_llm_client(mode, llm_session_id)
 
     async def complete(self, request: ChatCompletionRequest) -> Any:
+        if request.mode != self.mode:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Request mode does not match resolved backend.",
+            )
+        if request.llm_session_id != self.llm_session_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Request llm_session_id does not match resolved backend.",
+            )
+        if not request.model:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Model must be provided in the request.",
+            )
+
         payload: Dict[str, Any] = {
-            "model": self.model_name,
+            "model": request.model,
             "messages": [msg.model_dump() for msg in request.messages],
         }
         if request.max_tokens is not None:
@@ -73,26 +77,29 @@ class BackendClient:
 
 
 class GatewayRegistry:
-    def __init__(self, cfg: GatewayConfig):
-        self.config = cfg
-        self.backends: Dict[str, BackendClient] = {
-            backend_id: BackendClient(backend_cfg)
-            for backend_id, backend_cfg in cfg.backends.items()
-        }
+    def __init__(self) -> None:
+        self._cache: Dict[tuple[str, str], BackendClient] = {}
 
-    def resolve(self, backend_id: Optional[str]) -> BackendClient:
-        if backend_id and backend_id in self.backends:
-            return self.backends[backend_id]
+    def resolve(self, mode: Optional[str], llm_session_id: str) -> BackendClient:
+        if not mode:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Mode is required to resolve backend.",
+            )
+        cache_key = (mode, llm_session_id)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
-        # Fallback to default backend when alias is unknown (e.g. "internal-gateway").
-        client = self.backends.get(self.config.default_backend)
-        if client:
-            return client
+        try:
+            client = BackendClient(mode, llm_session_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
 
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No backend configured to handle the request.",
-        )
+        self._cache[cache_key] = client
+        return client
 
 
 def _build_chat_messages_from_responses(
@@ -124,7 +131,7 @@ def build_gateway_router(registry: GatewayRegistry) -> APIRouter:
 
     @router.post("/v1/chat/completions")
     async def chat_completions(request: ChatCompletionRequest) -> Any:
-        client = registry.resolve(request.model)
+        client = registry.resolve(request.mode, request.llm_session_id)
         result = await client.complete(request)
 
         if request.stream:
@@ -141,16 +148,18 @@ def build_gateway_router(registry: GatewayRegistry) -> APIRouter:
     @router.post("/responses")
     async def responses_endpoint(request: ResponsesRequest) -> Any:
         print(f"Received request: {request}")
-        client = registry.resolve(request.model)
+        backend_client = registry.resolve(request.mode, request.llm_session_id)
         messages = _build_chat_messages_from_responses(request)
         completion_request = ChatCompletionRequest(
+            mode=request.mode,
+            llm_session_id=request.llm_session_id,
             model=request.model,
             messages=messages,
             max_tokens=request.max_output_tokens,
             temperature=request.temperature,
         )
 
-        completion = await client.complete(completion_request)
+        completion = await backend_client.complete(completion_request)
 
         response_id = f"resp_{uuid.uuid4().hex}"
         message_id = f"msg_{uuid.uuid4().hex}"

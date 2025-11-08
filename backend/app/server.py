@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.websockets import WebSocketState
 
 from .codex import CodexInvocationError, CodexRunner, SessionPaths
-from .config import ConfigError, load_gateway_config, resolve_paths
+from .config import resolve_paths
 from .db import build_engine, build_session_factory, init_models
 from .gateway import GatewayRegistry, build_gateway_router
 from .models import Base, ChatSession, LLMSession, Message, User
@@ -59,11 +59,6 @@ def create_app() -> FastAPI:
     engine = build_engine(paths)
     session_factory = build_session_factory(engine)
 
-    try:
-        gateway_cfg = load_gateway_config(paths)
-    except ConfigError as exc:
-        raise RuntimeError(f"Failed to load gateway configuration: {exc}") from exc
-
     model_alias = os.environ.get("CODEX_MODEL_ALIAS", "internal-gateway")
     gateway_url = os.environ.get("CODEX_GATEWAY_URL", "http://127.0.0.1:8000")
     internal_api_key = os.environ.get("CODEX_INTERNAL_API_KEY", "internal-static-key")
@@ -75,7 +70,7 @@ def create_app() -> FastAPI:
         finally:
             await session.close()
 
-    gateway_registry = GatewayRegistry(gateway_cfg)
+    gateway_registry = GatewayRegistry()
     app.include_router(build_gateway_router(gateway_registry))
     app.include_router(build_prompts_router(get_session))
 
@@ -109,8 +104,8 @@ def create_app() -> FastAPI:
         payload: SessionCreateRequest,
         db: AsyncSession = Depends(get_session),
     ) -> SessionCreateResponse:
-        backend_client = gateway_registry.resolve(payload.model)
-        backend_id = backend_client.cfg.id
+        backend_client = gateway_registry.resolve(payload.mode, payload.llm_session_id)
+        backend_id = backend_client.backend_id
 
         user = await db.get(User, payload.user_id)
         if not user:
